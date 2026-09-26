@@ -13,6 +13,8 @@ object TaskLearning {
     private const val PREFS = "axon_task_learning"
     private const val KEY_TEMPLATES = "templates_v1"
     private const val MAX_TEMPLATES = 30
+    private const val KEY_PURGE_VERSION = "semantic_identity_purge_v1"
+    private const val PURGE_VERSION = 1
 
     data class Match(val id: String, val locators: List<LearnedLocator?>, val successes: Int, val score: Double)
     private data class Template(val id: String, val app: String, val signature: String,
@@ -65,6 +67,21 @@ object TaskLearning {
         } else Template("wf_${System.currentTimeMillis()}", app, sig, locators, 1, utterancePattern, flowTemplate)
         all.add(next)
         save(context, all.sortedByDescending { it.successes }.take(MAX_TEMPLATES))
+    }
+
+    fun purgeSuspectOnce(context: Context, isSuspect: (String) -> Boolean): Int {
+        return try {
+            val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            if (prefs.getInt(KEY_PURGE_VERSION, 0) >= PURGE_VERSION) return 0
+            val all = load(context)
+            val kept = all.filterNot { isSuspect(it.app) }
+            val removed = all.size - kept.size
+            if (removed > 0) save(context, kept)
+            prefs.edit().putInt(KEY_PURGE_VERSION, PURGE_VERSION).apply()
+            removed
+        } catch (_: Exception) {
+            0
+        }
     }
 
     /** لا نفعل shortcut قبل نجاحين؛ أول نجاح مجرد observation لا قاعدة موثوقة. */

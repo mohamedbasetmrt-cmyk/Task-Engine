@@ -26,6 +26,13 @@ object TaskUiReasoner {
         val latencyMs: Long = 0L
     )
 
+    data class AppIdentity(
+        val isMatch: Boolean,
+        val seenApp: String = "",
+        val raw: String = "",
+        val latencyMs: Long = 0L
+    )
+
     /** آخر خطأ vision (يُقرأ من الـ Engine لتمييز 429 عن الفشل المنطقي) */
     @Volatile var lastError: String = ""
         private set
@@ -316,6 +323,114 @@ object TaskUiReasoner {
             return null
         }
         return parsePresence(p2.raw, snap, taskId, stepId, targetDesc, p2.providerTag, ms, tier = "IMAGE")
+    }
+
+    fun decideAppIdentityBlocking(
+        context: Context,
+        taskId: String,
+        stepId: String,
+        snap: TaskUiSnapshot.UiSnapshot,
+        expectedApp: String,
+        timeoutSec: Long = 30
+    ): AppIdentity? {
+        lastError = ""
+        val t0 = System.currentTimeMillis()
+        val p1 = callVisionFast(context, taskId, "$stepId#t",
+            appIdentityPrompt(expectedApp, snap.elementText, snap.pkg, false), 12)
+        if (p1.raw != null) {
+            val verdict = parseAppIdentity(p1.raw, taskId, stepId, expectedApp, p1.providerTag,
+                System.currentTimeMillis() - t0, "TEXT-FIRST")
+            if (verdict?.isMatch == true && snap.nodes.isNotEmpty()) return verdict
+        } else if (TaskRateLimit.isRateLimit(p1.error)) {
+            lastError = p1.error ?: "unknown"
+            TaskExecutionLogger.logFailure(taskId, "identity:$stepId",
+                "vision call failed: ${lastError.take(150)}",
+                extra = "tier=text, expectedApp=$expectedApp")
+            return null
+        }
+        TaskExecutionLogger.log(taskId, "TEXT-FIRST $stepId identity miss → IMAGE retry")
+        val p2 = callVision(context, taskId, "$stepId#img", snap,
+            appIdentityPrompt(expectedApp, snap.elementText, snap.pkg, snap.shotOk),
+            timeoutSec, includeImage = true)
+        val ms = System.currentTimeMillis() - t0
+        if (p2.raw == null) {
+            lastError = p2.error ?: "unknown"
+            TaskExecutionLogger.logFailure(taskId, "identity:$stepId",
+                "vision call failed: ${lastError.take(150)}",
+                extra = "tiers=text+image, expectedApp=$expectedApp")
+            return null
+        }
+        return parseAppIdentity(p2.raw, taskId, stepId, expectedApp, p2.providerTag, ms, "IMAGE")
+    }
+
+    private fun appIdentityPrompt(expectedApp: String, elements: String, observedPackage: String, hasShot: Boolean): String {
+        val imgLine = if (hasShot)
+            "IMAGE: screenshot with numbered boxes. Each box number matches the ELEMENTS list."
+        else
+            "IMAGE: unavailable — decide from the ELEMENTS text list only."
+        return "You are a mobile app identity observer. Decide whether the CURRENT screen belongs to the app named by the user.\n" +
+                "EXPECTED_APP: $expectedApp\n" +
+                "OBSERVED_PACKAGE: $observedPackage\n" +
+                "\n$imgLine\n" +
+                "ELEMENTS:\n" + elements + "\n" +
+                "RULES:\n" +
+                "- Match the app semantically across languages, aliases, translations, and visible branding.\n" +
+                "- OBSERVED_PACKAGE is supporting evidence only; do not match solely because a package string is present.\n" +
+                "- Do not match Axon or another automation app when the UI is not the expected app.\n" +
+                "- If uncertain, return match:false and seen_app:\"unknown\".\n" +
+                "- Reply ONLY with JSON: {\"match\":true,\"seen_app\":\"actual app name\"} or {\"match\":false,\"seen_app\":\"actual app name or unknown\"}."
+    }
+
+    private fun parseAppIdentity(
+        rawIn: String,
+        taskId: String,
+        stepId: String,
+        expectedApp: String,
+        providerTag: String,
+        ms: Long,
+        tier: String
+    ): AppIdentity? {
+        return try {
+            val raw = rawIn.trim()
+            val start = raw.indexOf('{')
+            val end = raw.lastIndexOf('}')
+            if (start < 0 || end <= start) {
+                lastError = "unparseable app identity"
+                null
+            } else {
+                val obj = org.json.JSONObject(raw.substring(start, end + 1))
+                if (!obj.has("match")) {
+                    lastError = "app identity missing match"
+                    null
+                } else {
+                    val matchValue = obj.opt("match")
+                    if (matchValue !is Boolean) {
+                        lastError = "app identity match is not boolean"
+                        null
+                    } else {
+                        val isMatch = matchValue
+                        val seenValue = obj.opt("seen_app")
+                        val seenApp = if (seenValue is String) seenValue.trim() else ""
+                        val seenNormalized = seenApp.lowercase()
+                        val uncertain = seenNormalized in setOf("unknown", "unknown app", "not sure", "unsure", "n/a", "none", "null")
+                        if (isMatch && (seenApp.isBlank() || uncertain)) {
+                            lastError = "app identity missing concrete seen_app"
+                            TaskExecutionLogger.logFailure(taskId, "identity:$stepId",
+                                "model returned match=true without concrete seen_app", extra = "raw=${raw.take(150)}")
+                            null
+                        } else {
+                            TaskExecutionLogger.log(taskId,
+                                "IDENTITY $stepId via=$providerTag [$tier] ${ms}ms — " +
+                                        "expected=\"$expectedApp\" match=$isMatch seen_app=\"${seenApp.take(80)}\"")
+                            AppIdentity(isMatch, seenApp, raw, ms)
+                        }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            lastError = "app identity parse: ${e.message}"
+            null
+        }
     }
 
     private fun presencePrompt(targetDesc: String, elements: String, hasShot: Boolean): String {

@@ -9,7 +9,11 @@ object TaskPlanner {
         buildPlan(TaskIntentTranslator.IntentResult(goal, false, true))
 
     /** يحول النية (+params) لخطة ثابتة. UNKNOWN → خطة فارغة (تترفض بشياكة). */
-    fun buildPlan(intent: TaskIntentTranslator.IntentResult, learned: TaskLearning.Match? = null): List<TaskStep> {
+    fun buildPlan(
+        intent: TaskIntentTranslator.IntentResult,
+        learned: TaskLearning.Match? = null,
+        alreadyForeground: Boolean = false
+    ): List<TaskStep> {
         val goal = intent.goal
         // ── V1 ──
         if (goal == TaskGoal.OPEN_SETTINGS) return listOf(
@@ -28,10 +32,12 @@ object TaskPlanner {
         // ── V2: عام ──
         if (goal == TaskGoal.OPEN_APP) {
             val app = intent.app.ifBlank { return emptyList() }
-            return listOf(
-                TaskStep("open", TaskStepKind.OPEN_APP, "Open $app", param = app),
-                TaskStep("verify_open", TaskStepKind.VERIFY_APP, "Verify $app foreground", param = app)
-            )
+            val steps = mutableListOf<TaskStep>()
+            if (!alreadyForeground) {
+                steps += TaskStep("open", TaskStepKind.OPEN_APP, "Open $app", param = app)
+            }
+            steps += TaskStep("verify_open", TaskStepKind.VERIFY_APP, "Verify $app foreground", param = app)
+            return steps
         }
         if (goal == TaskGoal.UI_WAIT) {
             val app = intent.app.ifBlank { return emptyList() }
@@ -57,7 +63,9 @@ object TaskPlanner {
             val app = intent.app.ifBlank { return emptyList() }
             if (intent.flow.isEmpty()) return emptyList()
             val steps = mutableListOf<TaskStep>()
-            steps += TaskStep("open", TaskStepKind.OPEN_APP, "Open $app", param = app)
+            if (!alreadyForeground) {
+                steps += TaskStep("open", TaskStepKind.OPEN_APP, "Open $app", param = app)
+            }
             steps += TaskStep("verify_open", TaskStepKind.VERIFY_APP, "Verify $app foreground", param = app)
             intent.flow.forEachIndexed { i, f ->
                 val n = i + 1

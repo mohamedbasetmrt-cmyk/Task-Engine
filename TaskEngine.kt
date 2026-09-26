@@ -88,6 +88,43 @@ object TaskEngine {
             TaskForegroundService.start(ctx, taskId)
             try { TaskEdgeGlowController.attach(ctx) } catch (_: Exception) {}
 
+            fun appKey(app: String): String? {
+                val n = app.trim().lowercase()
+                if (n.isBlank()) return null
+                if (n.contains(".")) return n
+                val known = mapOf(
+                    "settings" to listOf("settings", "setting", "الإعدادات", "اعدادات", "الاعدادات"),
+                    "whatsapp" to listOf("whatsapp", "واتساب", "واتس اب", "واتس‌اب"),
+                    "instagram" to listOf("instagram", "انستقرام", "انستغرام"),
+                    "telegram" to listOf("telegram", "تيليجرام", "تلغرام"),
+                    "facebook" to listOf("facebook", "فيسبوك", "فيس بوك"),
+                    "youtube" to listOf("youtube", "يوتيوب"),
+                    "chrome" to listOf("chrome", "كروم", "جوجل كروم"),
+                    "gmail" to listOf("gmail", "جيميل", "جي_mail"),
+                    "maps" to listOf("maps", "خرائط", "الخرائط", "google maps", "خرائط جوجل"),
+                    "contacts" to listOf("contacts", "جهات الاتصال", "الجهات"),
+                    "camera" to listOf("camera", "الكاميرا", "كاميرا"),
+                    "gallery" to listOf("gallery", "معرض", "المعرض", "صور", "الصور"),
+                    "messages" to listOf("messages", "الرسائل", "رسائل"),
+                    "clock" to listOf("clock", "الساعة", "ساعة"),
+                    "calculator" to listOf("calculator", "الحاسبة", "آلة حاسبة"),
+                    "spotify" to listOf("spotify", "سبوتيفاي"),
+                    "tiktok" to listOf("tiktok", "تيك توك", "تيكتوك"),
+                    "outlook" to listOf("outlook", "آوتوك", "أوتوك"),
+                    "axon" to listOf("axon", "axon assistant", "مساعد axon", "اكسون", "أكسون")
+                )
+                for ((key, aliases) in known) {
+                    if (aliases.any { alias -> n.contains(alias) }) return key
+                }
+                return n.split(Regex("[^a-z0-9]+"))
+                    .firstOrNull { it.length >= 2 && it !in setOf("app", "application", "com") }
+            }
+
+            val purgedLearned = TaskLearning.purgeSuspectOnce(ctx) { app -> appKey(app) == null }
+            if (purgedLearned > 0) {
+                TaskExecutionLogger.log(taskId, "LEARNING purge removed $purgedLearned suspect template(s)")
+            }
+
             // ── 1) ترجمة النية: LLM call واحدة + fallback حتمي ──
             TaskExecutionLogger.log(taskId, "Resolving intent (learned template → LLM → rules)…")
             val resolvedIntent = TaskLearning.recallIntent(ctx, userText) ?: try {
@@ -119,12 +156,57 @@ object TaskEngine {
                 return@execute
             }
 
+            fun isKnownAppKey(key: String): Boolean = key in setOf(
+                "settings", "whatsapp", "instagram", "telegram", "facebook", "youtube",
+                "chrome", "gmail", "maps", "contacts", "camera", "gallery", "messages",
+                "clock", "calculator", "spotify", "tiktok", "outlook", "axon"
+            )
+
+            fun matchesAppPackage(packageName: String, appName: String): Boolean {
+                val requested = appName.trim().lowercase()
+                val normalized = packageName.trim().lowercase()
+                if (requested.isBlank() || normalized.isBlank()) return false
+                if (requested.contains(".")) return normalized == requested
+                val key = appKey(appName) ?: return false
+                if (key == "axon" && normalized == ctx.packageName.lowercase()) return true
+                if (!isKnownAppKey(key)) return false
+                return normalized == key || normalized.endsWith(".$key")
+            }
+
+            var alreadyForeground = false
+            var preflightPackage: String? = null
+            if (intent.goal == TaskGoal.UI_FLOW || intent.goal == TaskGoal.OPEN_APP) {
+                val observation = try {
+                    TaskObserver.observeWithSource(ctx)
+                } catch (e: Exception) {
+                    TaskExecutionLogger.logWarn(taskId, "open-app-precheck",
+                        "observer failed: ${e.message}")
+                    null
+                }
+                val observedPackage = observation?.state?.foregroundPackage.orEmpty()
+                val source = observation?.source ?: "unknown"
+                val matches = observation?.source == "a11y" &&
+                        matchesAppPackage(observedPackage, intent.app)
+                alreadyForeground = matches
+                preflightPackage = observedPackage.takeIf { matches }
+                TaskExecutionLogger.log(taskId,
+                    "OPEN_APP_PRECHECK ${intent.goal} — pkg=$observedPackage source=$source " +
+                            "target=${intent.app} alreadyForeground=$matches " +
+                            "decision=${if (matches) "SKIP_OPEN" else "DISPATCH_OPEN"}")
+            }
+            if (cancelFlag.get()) {
+                emit(TaskEvent(taskId, TaskEventType.TASK_CANCELLED, "after open precheck"))
+                finish(TaskRecord(taskId, intent.goal, userText, TaskState.CANCELLED,
+                    finishedAt = System.currentTimeMillis()))
+                return@execute
+            }
+
             // ── 2) خطة حتمية (V1+V2: النية الكاملة بالـ params) ──
             val learnedMatch = TaskLearning.match(ctx, intent)
             if (learnedMatch != null) TaskExecutionLogger.log(taskId,
                 "LEARNING template=${learnedMatch.id} matched score=${"%.2f".format(learnedMatch.score)} " +
                         "successes=${learnedMatch.successes} — evidence remains required")
-            val plan = TaskPlanner.buildPlan(intent, learnedMatch)
+            val plan = TaskPlanner.buildPlan(intent, learnedMatch, alreadyForeground)
             if (plan.isEmpty()) {
                 TaskExecutionLogger.logFailure(taskId, "plan", "no plan for goal=${intent.goal} — unsupported",
                     goal = intent.goal.name, extra = "input=${userText.take(120)} app=${intent.app} target=${intent.target}")
@@ -145,6 +227,18 @@ object TaskEngine {
             var lastPreSig = ""
             var lastActionProof: ActionProof? = null
             val learnedObserved = mutableMapOf<String, LearnedLocator>()
+            var verifiedAppPackage: String? = null
+            val reconcileMaxBackPresses = 3
+            val wasAlreadyForeground = intent.goal == TaskGoal.UI_FLOW && alreadyForeground
+            val wasAlreadyForegroundPackage = if (wasAlreadyForeground) preflightPackage else null
+            var reconciliationAttempted = false
+            val firstFlowActionId = plan.firstOrNull { step ->
+                step.kind == TaskStepKind.UI_CLICK ||
+                        step.kind == TaskStepKind.UI_TYPE ||
+                        step.kind == TaskStepKind.UI_SCROLL ||
+                        step.kind == TaskStepKind.UI_WAIT ||
+                        step.kind == TaskStepKind.UI_BACK
+            }?.id
 
             // ── V2 helpers (snapshot → reason → act) ──
             fun runOpenApp(step: TaskStep): String? {
@@ -171,7 +265,7 @@ object TaskEngine {
             fun runUiClick(step: TaskStep): String? {
                 // فلتر أمان: هدف يطابق التطبيق المفتوح نفسه (أيقونة/اسم الـ app) يُرفض قبل أي فعل
                 val appNorm = intent.app.lowercase().filter { it.isLetterOrDigit() }
-                if (appNorm.length >= 3 &&
+                if (appNorm.isNotEmpty() &&
                     step.param.lowercase().filter { it.isLetterOrDigit() }.contains(appNorm)
                 ) {
                     TaskExecutionLogger.logFailure(taskId, "safety:${step.id}",
@@ -203,6 +297,16 @@ object TaskEngine {
                     if (snap.nodes.isEmpty()) {
                         lastErr = "empty tree (attempt $attempt)"
                         try { Thread.sleep(1000) } catch (_: Exception) {}
+                        continue
+                    }
+                    val verifiedPackage = verifiedAppPackage?.takeIf {
+                        it.isNotBlank() && !it.equals("unknown", ignoreCase = true)
+                    }
+                    if (verifiedPackage == null || snap.pkg != verifiedPackage) {
+                        lastErr = "snapshot package ${snap.pkg} does not match verified package ${verifiedPackage ?: "unknown"}"
+                        TaskExecutionLogger.logWarn(taskId, "safety:${step.id}",
+                            "$lastErr; refusing tap and re-observing")
+                        try { Thread.sleep(800) } catch (_: Exception) {}
                         continue
                     }
                     val excludedHere = snap.nodes.withIndex()
@@ -256,6 +360,21 @@ object TaskEngine {
                     }
                     val rect = TaskUiSnapshot.parseBounds(node.bounds)
                         ?: run { lastErr = "bad bounds"; continue }
+                    val packageStillVerified = try {
+                        val observation = TaskObserver.observeWithSource(ctx)
+                        observation.source == "a11y" &&
+                                observation.state.foregroundPackage == verifiedPackage
+                    } catch (e: Exception) {
+                        TaskExecutionLogger.logWarn(taskId, "safety:${step.id}",
+                            "foreground recheck failed: ${e.message}")
+                        false
+                    }
+                    if (!packageStillVerified) {
+                        lastErr = "foreground package changed before tap; refusing action"
+                        TaskExecutionLogger.logWarn(taskId, "safety:${step.id}", lastErr)
+                        try { Thread.sleep(800) } catch (_: Exception) {}
+                        continue
+                    }
                     lastPreSig = snap.signature
                     val tappedEditable = node.editable
                     val res = TapElementAction(rect, "#${d.element}", node).execute(ctx)
@@ -416,49 +535,233 @@ object TaskEngine {
             }
 
             /** تحقق سريع: التطبيق المطلوب فعلًا في الواجهة؟ — fail fast بدل الدوس في الهوا */
-            fun appKey(app: String): String {
-                val n = app.lowercase()
-                val known = listOf("whatsapp", "settings", "instagram", "telegram", "facebook",
-                    "youtube", "chrome", "gmail", "maps", "contacts", "camera", "gallery",
-                    "messages", "clock", "calculator", "spotify", "tiktok", "outlook")
-                for (k in known) if (n.contains(k)) return k
-                return n.split(Regex("[^a-z0-9]+")).firstOrNull { it.length >= 2 } ?: "app"
+            fun reconciliationTarget(step: TaskStep): String? = when (step.kind) {
+                TaskStepKind.UI_CLICK, TaskStepKind.UI_TYPE,
+                TaskStepKind.UI_SCROLL, TaskStepKind.UI_WAIT -> step.param.takeIf { it.isNotBlank() }
+                else -> null
+            }
+
+            fun observeReconcileForeground(step: TaskStep): Boolean {
+                val expected = wasAlreadyForegroundPackage ?: return false
+                val observation = try {
+                    TaskObserver.observeWithSource(ctx)
+                } catch (e: Exception) {
+                    TaskExecutionLogger.logWarn(taskId, "reconcile:${step.id}",
+                        "foreground observation failed: ${e.message}; proceeding without BACK")
+                    return false
+                }
+                val same = observation.source == "a11y" && observation.state.foregroundPackage == expected
+                TaskExecutionLogger.log(taskId,
+                    "RECONCILE ${step.id} — foreground via=${observation.source} " +
+                            "pkg=${observation.state.foregroundPackage} target=$expected match=$same")
+                return same
+            }
+
+            fun runFlowReconciliation(step: TaskStep): String? {
+                val target = reconciliationTarget(step) ?: return null
+                val expectedPackage = wasAlreadyForegroundPackage ?: return null
+                var backs = 0
+                var checks = 0
+                while (true) {
+                    if (cancelFlag.get()) return "CANCELLED_SENTINEL"
+                    checks++
+                    if (!observeReconcileForeground(step)) {
+                        TaskExecutionLogger.logWarn(taskId, "reconcile:${step.id}",
+                            "target app is not reliably foreground; proceeding without BACK")
+                        return null
+                    }
+                    if (cancelFlag.get()) return "CANCELLED_SENTINEL"
+                    val snap = try {
+                        TaskUiSnapshot.captureBlocking(ctx, taskId, "${step.id}#reconcile$checks")
+                    } catch (e: Exception) {
+                        TaskExecutionLogger.logWarn(taskId, "reconcile:${step.id}",
+                            "snapshot failed: ${e.message}; proceeding without BACK")
+                        return null
+                    }
+                    if (snap.nodes.isEmpty() || snap.pkg != expectedPackage) {
+                        TaskExecutionLogger.logWarn(taskId, "reconcile:${step.id}",
+                            "snapshot package=${snap.pkg} target=$expectedPackage nodes=${snap.nodes.size}; inconclusive")
+                        return null
+                    }
+                    if (cancelFlag.get()) return "CANCELLED_SENTINEL"
+                    val presence = try {
+                        TaskUiReasoner.decidePresenceBlocking(
+                            ctx, taskId, "${step.id}#reconcile$checks", snap, target)
+                    } catch (e: Exception) {
+                        TaskExecutionLogger.logWarn(taskId, "reconcile:${step.id}",
+                            "presence check failed: ${e.message}; proceeding without BACK")
+                        return null
+                    }
+                    if (cancelFlag.get()) return "CANCELLED_SENTINEL"
+                    if (presence == null) {
+                        val error = TaskUiReasoner.lastError.ifBlank { "unknown" }
+                        TaskExecutionLogger.logWarn(taskId, "reconcile:${step.id}",
+                            "presence inconclusive (${error.take(120)}); proceeding without BACK")
+                        return null
+                    }
+                    if (presence.visible) {
+                        TaskExecutionLogger.log(taskId,
+                            "RECONCILE ${step.id} — target visible after $backs BACK press(es); proceeding")
+                        return null
+                    }
+                    if (backs >= reconcileMaxBackPresses) {
+                        TaskExecutionLogger.log(taskId,
+                            "RECONCILE ${step.id} — target not visible after $backs BACK press(es); proceeding")
+                        return null
+                    }
+                    if (cancelFlag.get()) return "CANCELLED_SENTINEL"
+                    backs++
+                    TaskExecutionLogger.log(taskId,
+                        "RECONCILE ${step.id} — target absent; BACK $backs/$reconcileMaxBackPresses")
+                    val back = try {
+                        BackAction().execute(ctx)
+                    } catch (e: Exception) {
+                        ActionResult(false, e.message ?: "back failed")
+                    }
+                    if (!back.success) {
+                        TaskExecutionLogger.logWarn(taskId, "reconcile:${step.id}",
+                            "BACK rejected: ${back.detail.take(120)}; proceeding without more BACK")
+                        return null
+                    }
+                    TaskExecutionLogger.log(taskId,
+                        "RECONCILE ${step.id} — BACK dispatched: ${back.detail.take(120)}")
+                    if (cancelFlag.get()) return "CANCELLED_SENTINEL"
+                }
             }
 
             fun runVerifyApp(step: TaskStep): String? {
-                val key = appKey(step.param)
+                val expectedApp = step.param.trim()
                 var attempt = 0
                 var lastPkg = "unknown"
                 var lastSource = "unknown"
+                var lastErr = "not observed"
+                if (expectedApp.isBlank()) {
+                    TaskExecutionLogger.logVerify(taskId, step.id, false, expectedApp, lastPkg)
+                    emit(TaskEvent(taskId, TaskEventType.STEP_FAILED, "${step.id}:FAIL empty-app"))
+                    return "verify app failed: empty app name"
+                }
+                val key = appKey(expectedApp)
                 while (attempt < 3) {
+                    if (cancelFlag.get()) return "CANCELLED_SENTINEL"
                     attempt++
-                    try {
-                        val obs = TaskObserver.observeWithSource(ctx)
-                        lastPkg = obs.state.foregroundPackage
-                        lastSource = obs.source
+                    val observation = try {
+                        TaskObserver.observeWithSource(ctx)
                     } catch (e: Exception) {
-                        TaskExecutionLogger.logFailure(taskId, "observe:${step.id}",
-                            "observer threw: ${e.message}", goal = intentGoalName, step = step.id, throwable = e)
+                        TaskExecutionLogger.logWarn(taskId, "observe:${step.id}",
+                            "observer failed: ${e.message}")
+                        null
                     }
+                    lastPkg = observation?.state?.foregroundPackage ?: "unknown"
+                    lastSource = observation?.source ?: "unknown"
+                    if (cancelFlag.get()) return "CANCELLED_SENTINEL"
                     TaskExecutionLogger.log(taskId,
-                        "VERIFY_APP ${step.id} #$attempt/3 via=$lastSource pkg=$lastPkg (expect ~$key)")
-                    if (lastPkg.lowercase().contains(key)) {
-                        TaskExecutionLogger.logVerify(taskId, step.id, true,
-                            "${step.param} foreground", lastPkg)
-                        emit(TaskEvent(taskId, TaskEventType.STEP_COMPLETED, "${step.id}:PASS via=$lastSource"))
-                        return null
+                        "VERIFY_APP ${step.id} #$attempt/3 via=$lastSource pkg=$lastPkg " +
+                                "semantic expected=$expectedApp")
+                    val snap = try {
+                        TaskUiSnapshot.captureBlocking(ctx, taskId, "${step.id}#verify$attempt")
+                    } catch (e: Exception) {
+                        TaskExecutionLogger.logWarn(taskId, "snapshot:${step.id}",
+                            "capture failed: ${e.message}")
+                        null
+                    }
+                    if (cancelFlag.get()) return "CANCELLED_SENTINEL"
+                    val automationIsExpected = matchesAppPackage(ctx.packageName, expectedApp)
+                    if ((lastPkg == ctx.packageName || snap?.pkg == ctx.packageName) && !automationIsExpected) {
+                        lastErr = "automation package is foreground; refusing identity match"
+                        if (key == null) break
+                        if (attempt < 3) try { Thread.sleep(1200) } catch (_: Exception) {}
+                        continue
+                    }
+                    if (snap == null) {
+                        lastErr = "semantic snapshot unavailable"
+                        if (key != null && lastSource == "a11y" && matchesAppPackage(lastPkg, expectedApp)) {
+                            verifiedAppPackage = lastPkg.takeIf { it != "unknown" }
+                            TaskExecutionLogger.log(taskId,
+                                "VERIFY_APP ${step.id} semantic unavailable; safe package fallback used")
+                            TaskExecutionLogger.logVerify(taskId, step.id, true, expectedApp, lastPkg)
+                            emit(TaskEvent(taskId, TaskEventType.STEP_COMPLETED,
+                                "${step.id}:PASS via=$lastSource fallback=package"))
+                            return null
+                        }
+                        if (key == null) {
+                            lastErr = "semantic snapshot unavailable and no safe app key"
+                            break
+                        }
+                    } else if (!snap.shotOk &&
+                            (snap.nodes.isEmpty() || snap.pkg.isBlank() || snap.pkg == "unknown")) {
+                        lastErr = "semantic snapshot unavailable"
+                        if (key != null && lastSource == "a11y" && matchesAppPackage(lastPkg, expectedApp)) {
+                            verifiedAppPackage = lastPkg.takeIf { it != "unknown" }
+                            TaskExecutionLogger.log(taskId,
+                                "VERIFY_APP ${step.id} semantic unavailable; safe package fallback used")
+                            TaskExecutionLogger.logVerify(taskId, step.id, true, expectedApp, lastPkg)
+                            emit(TaskEvent(taskId, TaskEventType.STEP_COMPLETED,
+                                "${step.id}:PASS via=$lastSource fallback=package"))
+                            return null
+                        }
+                        if (key == null) {
+                            lastErr = "semantic snapshot unavailable and no safe app key"
+                            break
+                        }
+                    } else if (lastPkg != "unknown" && snap.pkg != "unknown" && snap.pkg != lastPkg) {
+                        lastErr = "observer/snapshot package mismatch ($lastPkg vs ${snap.pkg})"
+                        if (key == null) break
+                    } else {
+                        val verdict = try {
+                            TaskUiReasoner.decideAppIdentityBlocking(
+                                ctx, taskId, "${step.id}#identity$attempt", snap, expectedApp)
+                        } catch (e: Exception) {
+                            TaskExecutionLogger.logWarn(taskId, "identity:${step.id}",
+                                "semantic check failed: ${e.message}")
+                            null
+                        }
+                        if (cancelFlag.get()) return "CANCELLED_SENTINEL"
+                        if (verdict == null) {
+                            val reason = TaskUiReasoner.lastError.ifBlank { "unknown" }
+                            if (key != null && lastSource == "a11y" &&
+                                    (matchesAppPackage(lastPkg, expectedApp) ||
+                                            matchesAppPackage(snap.pkg, expectedApp))) {
+                                verifiedAppPackage = snap.pkg.takeIf { it != "unknown" } ?: lastPkg
+                                TaskExecutionLogger.log(taskId,
+                                    "VERIFY_APP ${step.id} semantic inconclusive; safe package fallback used ($reason)")
+                                TaskExecutionLogger.logVerify(taskId, step.id, true, expectedApp,
+                                    "$lastPkg/${snap.pkg}")
+                                emit(TaskEvent(taskId, TaskEventType.STEP_COMPLETED,
+                                    "${step.id}:PASS via=$lastSource fallback=package"))
+                                return null
+                            }
+                            lastErr = "semantic identity inconclusive: $reason"
+                            if (key == null) break
+                        } else if (verdict.isMatch) {
+                            val actualPackage = snap.pkg.takeIf { it.isNotBlank() && it != "unknown" }
+                                ?: lastPkg.takeIf { it.isNotBlank() && it != "unknown" }
+                            val exactExpectedPackage = expectedApp.takeIf { it.contains(".") }
+                            val exactPackageMatch = exactExpectedPackage == null ||
+                                    (actualPackage != null && actualPackage.equals(exactExpectedPackage, ignoreCase = true))
+                            if (actualPackage == null || !exactPackageMatch) {
+                                lastErr = if (actualPackage == null)
+                                    "semantic match without package evidence"
+                                else
+                                    "semantic match package $actualPackage does not equal requested $exactExpectedPackage"
+                                if (key == null) break
+                            } else {
+                                verifiedAppPackage = actualPackage
+                                TaskExecutionLogger.log(taskId,
+                                    "VERIFY_APP ${step.id} semantic match seen_app=${verdict.seenApp}")
+                                TaskExecutionLogger.logVerify(taskId, step.id, true, expectedApp, actualPackage)
+                                emit(TaskEvent(taskId, TaskEventType.STEP_COMPLETED,
+                                    "${step.id}:PASS via=$lastSource semantic=${verdict.seenApp}"))
+                                return null
+                            }
+                        } else {
+                            lastErr = "semantic identity mismatch: ${verdict.seenApp.ifBlank { "unknown" }}"
+                        }
                     }
                     if (attempt < 3) try { Thread.sleep(1200) } catch (_: Exception) {}
                 }
-                TaskExecutionLogger.logVerify(taskId, step.id, false,
-                    "${step.param} foreground (~$key)", lastPkg)
+                TaskExecutionLogger.logVerify(taskId, step.id, false, expectedApp, lastPkg)
                 emit(TaskEvent(taskId, TaskEventType.STEP_FAILED, "${step.id}:FAIL pkg=$lastPkg"))
-                return if (lastPkg == "unknown") {
-                    "verify app failed: ${step.param} not observed (saw unknown ×3) — " +
-                            "شغّل Axon Assistant من Accessibility أو امنح Usage Access"
-                } else {
-                    "verify app failed: expected ${step.param} foreground but saw $lastPkg"
-                }
+                return "verify app failed: expected $expectedApp — $lastErr"
             }
 
             /** سكرول خفيف طبيعي للاستكشاف: swipe قصير + presence — حد أقصى 3 مرات */
@@ -550,6 +853,23 @@ object TaskEngine {
                 TaskExecutionLogger.trackStep(taskId, step.id)
                 emit(TaskEvent(taskId, TaskEventType.STEP_STARTED, "${step.id}:${step.kind}"))
                 TaskExecutionLogger.log(taskId, "STEP ${step.id} [${step.kind}] — ${step.label}")
+
+                if (intent.goal == TaskGoal.UI_FLOW && wasAlreadyForeground &&
+                        firstFlowActionId == step.id && !reconciliationAttempted) {
+                    reconciliationAttempted = true
+                    if (reconciliationTarget(step) == null) {
+                        TaskExecutionLogger.log(taskId,
+                            "RECONCILE ${step.id} — skipped (no visual target or first action is BACK)")
+                    } else {
+                        val reconciliationResult = runFlowReconciliation(step)
+                        if (cancelFlag.get() || reconciliationResult == "CANCELLED_SENTINEL") {
+                            emit(TaskEvent(taskId, TaskEventType.TASK_CANCELLED, "at ${step.id}"))
+                            finish(TaskRecord(taskId, intent.goal, userText, TaskState.CANCELLED,
+                                currentStep = step.id, finishedAt = System.currentTimeMillis()))
+                            return@execute
+                        }
+                    }
+                }
 
                 when (step.kind) {
                     TaskStepKind.VERIFY_SETTINGS, TaskStepKind.VERIFY_RETURN -> {
@@ -684,14 +1004,20 @@ object TaskEngine {
                             break
                         }
                     }
-                    TaskStepKind.VERIFY_APP -> {
-                        val r = runVerifyApp(step)
-                        if (r != null) {
-                            failedReason = r
-                            break
-                        }
-                    }
-                    TaskStepKind.VERIFY_TEXT -> {
+                     TaskStepKind.VERIFY_APP -> {
+                         val r = runVerifyApp(step)
+                         if (cancelFlag.get() || r == "CANCELLED_SENTINEL") {
+                             emit(TaskEvent(taskId, TaskEventType.TASK_CANCELLED, "at ${step.id}"))
+                             finish(TaskRecord(taskId, intent.goal, userText, TaskState.CANCELLED,
+                                 currentStep = step.id, finishedAt = System.currentTimeMillis()))
+                             return@execute
+                         }
+                         if (r != null) {
+                             failedReason = r
+                             break
+                         }
+                     }
+                     TaskStepKind.VERIFY_TEXT -> {
                         val r = runVerifyText(step)
                         if (r != null) {
                             failedReason = r
@@ -708,8 +1034,15 @@ object TaskEngine {
                 }
             }
 
-            // ── 4) النهاية ──
-            if (failedReason == null) {
+             // ── 4) النهاية ──
+             if (cancelFlag.get()) {
+                 emit(TaskEvent(taskId, TaskEventType.TASK_CANCELLED, "after steps"))
+                 finish(TaskRecord(taskId, intent.goal, userText, TaskState.CANCELLED,
+                     currentStep = currentStepName.ifBlank { null },
+                     finishedAt = System.currentTimeMillis()))
+                 return@execute
+             }
+             if (failedReason == null) {
                 if (intent.goal == TaskGoal.UI_FLOW) {
                     val locators = intent.flow.mapIndexed { i, flow ->
                         when (flow.op) { "click" -> learnedObserved["click${i + 1}"]; "type" -> learnedObserved["type${i + 1}"]; else -> null }
